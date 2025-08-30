@@ -217,16 +217,16 @@ from gtts import gTTS
 import pygame
 import io
 import wave
-
 from audio_utils import AudioConverter
 from config import config
 
 logger = logging.getLogger(__name__)
 
 class TwilioTTSAgent:
-    def __init__(self, websocket: WebSocket, call_sid: str):
+    def __init__(self, websocket: WebSocket, call_sid: str, stream_sid: Optional[str] = None):
         self.websocket = websocket
         self.call_sid = call_sid
+        self.stream_sid = stream_sid or call_sid
         self.audio_converter = AudioConverter()
         self.running = False
         self.ready = False
@@ -349,7 +349,7 @@ class TwilioTTSAgent:
             for i, chunk in enumerate(chunks):
                 message = {
                     "event": "media",
-                    "streamSid": self.call_sid,
+                    "streamSid": self.stream_sid,
                     "media": {
                         "payload": base64.b64encode(chunk).decode('utf-8')
                     }

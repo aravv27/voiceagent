@@ -200,7 +200,7 @@ async def handle_media_stream(websocket: WebSocket):
                     if call_sid and not agent:
                         logger.info(f"[DEBUG] 🤖 Initializing TTS agent...")
                         try:
-                            agent = TwilioGeminiAgent(websocket, call_sid)
+                            agent = TwilioGeminiAgent(websocket, call_sid, stream_sid)
                             active_sessions[call_sid] = agent
                             logger.info(f"[DEBUG] ✅ Agent created successfully")
                             
