@@ -14,7 +14,7 @@ import logging
 import traceback
 from gemini_agent import TwilioGeminiAgent
 from config import config
-
+import time
 # Configure logging FIRST
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,6 +28,16 @@ except ValueError as e:
     exit(1)
 
 app = FastAPI(title="Twilio-Gemini Outbound Bridge")
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, specify your tunnel domain
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 # Initialize Twilio client
 twilio_client = TwilioClient(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
@@ -108,24 +118,18 @@ async def outbound_twiml(request: Request):
     try:
         response = VoiceResponse()
         ws_url = f"wss://{config.PUBLIC_DOMAIN}/media-stream"
+        response.say("Connecting to AI assistant...")
         
-        logger.info(f"[DEBUG] 🔗 Outbound TwiML with WebSocket: {ws_url}")
+        logger.info(f"[DEBUG] 🔗 Outbound TwiML with BIDIRECTIONAL WebSocket: {ws_url}")
         
-        # Start streaming immediately
-        start = response.start()
-        start.stream(url=ws_url, track="both_tracks")
-        
-        # Brief pause to establish connection
-        response.pause(length=1)
-        
-        # Let the AI introduce itself
-        response.say("Hello! I'm your AI assistant.")
-        
-        # Keep the call alive for conversation
-        response.pause(length=300)
-        
+        # Use Connect instead of Start for bidirectional streaming
+        connect = response.connect()
+        connect.stream(url=ws_url, track="both_tracks")
+        response.say("Connection failed. Goodbye.")
+        response.hangup()
+
         twiml_content = str(response)
-        logger.info(f"[DEBUG] 📋 Outbound TwiML: {twiml_content}")
+        logger.info(f"[DEBUG] 📋 Bidirectional TwiML: {twiml_content}")
         return Response(content=str(response), media_type="application/xml")
         
     except Exception as e:
@@ -153,42 +157,35 @@ async def call_status_callback(request: Request):
 @app.websocket("/media-stream")
 async def handle_media_stream(websocket: WebSocket):
     client_ip = websocket.client.host if websocket.client else "unknown"
-    logger.info(f"[DEBUG] ⭐ WebSocket connection from Twilio IP: {client_ip}")
+    logger.info(f"[DEBUG] ⭐ WebSocket connection from IP: {client_ip}")
+    
+    agent = None
+    call_sid = None
+    temp_call_sid = None
+    message_count = 0
     
     try:
         await websocket.accept()
-        logger.info("[DEBUG] ✅ WebSocket connection accepted")
+        logger.info("[DEBUG] ✅ WebSocket connection accepted successfully")
         
-        # CRITICAL FIX: Initialize agent immediately for outbound calls
-        # Generate a temporary call_sid from the WebSocket connection
-        import time
+        # Create temp call_sid but DON'T initialize agent yet
         temp_call_sid = f"WS_{int(time.time())}"
+        logger.info(f"[DEBUG] 🎧 WebSocket ready, waiting for Twilio messages...")
         
-        agent = TwilioGeminiAgent(websocket, temp_call_sid)
-        active_sessions[temp_call_sid] = agent
-        
-        logger.info(f"[DEBUG] 🤖 Initializing agent immediately for outbound call")
-        try:
-            await agent.start_and_wait()
-            logger.info(f"[DEBUG] ✅ Agent ready for outbound call")
-        except Exception as e:
-            logger.error(f"[DEBUG] ❌ Agent startup failed: {e}")
-            return
-        
-        call_sid = None
-        message_count = 0
-        
-        # Process incoming messages
+        # Process ALL incoming messages with detailed logging
         async for message in websocket.iter_text():
             message_count += 1
-            logger.info(f"[DEBUG] 📨 Message #{message_count}: {message[:200]}...")
+            logger.info(f"[DEBUG] 📨 RAW Message #{message_count}: {message[:200]}...")
             
             try:
                 data = json.loads(message)
                 event_type = data.get("event", "unknown")
-                logger.info(f"[DEBUG] 🎯 Event: {event_type}")
+                logger.info(f"[DEBUG] 🎯 Event Type: {event_type}")
                 
-                if event_type == "start":
+                if event_type == "connected":
+                    logger.info(f"[DEBUG] 🔗 Twilio WebSocket protocol connected")
+                    
+                elif event_type == "start":
                     start_data = data.get("start", {})
                     call_sid = start_data.get("callSid")
                     stream_sid = start_data.get("streamSid")
@@ -199,48 +196,76 @@ async def handle_media_stream(websocket: WebSocket):
                     logger.info(f"[DEBUG]   Stream SID: {stream_sid}")
                     logger.info(f"[DEBUG]   Tracks: {tracks}")
                     
-                    # Update agent with real call_sid
-                    if call_sid and call_sid != temp_call_sid:
-                        agent.call_sid = call_sid
-                        active_sessions[call_sid] = agent
-                        if temp_call_sid in active_sessions:
-                            del active_sessions[temp_call_sid]
+                    # NOW initialize and start the agent ONLY after 'start' event
+                    if call_sid and not agent:
+                        logger.info(f"[DEBUG] 🤖 Initializing TTS agent...")
+                        try:
+                            agent = TwilioGeminiAgent(websocket, call_sid)
+                            active_sessions[call_sid] = agent
+                            logger.info(f"[DEBUG] ✅ Agent created successfully")
+                            
+                            logger.info(f"[DEBUG] 🎬 Starting TTS agent...")
+                            await agent.start_and_wait()
+                            logger.info(f"[DEBUG] ✅ Agent started and ready")
+                            
+                        except Exception as agent_error:
+                            logger.error(f"[DEBUG] ❌ Agent initialization failed: {agent_error}")
+                            logger.error(f"[DEBUG] ❌ Traceback: {traceback.format_exc()}")
                     
                 elif event_type == "media":
-                    media_data = data.get("media", {})
-                    track = media_data.get("track", "unknown")
-                    payload_length = len(media_data.get("payload", ""))
-                    
-                    logger.info(f"[DEBUG] 🎵 Media packet: track={track}, size={payload_length}")
-                    await agent.handle_incoming_audio(media_data)
-                    
+                    if agent:
+                        media_data = data.get("media", {})
+                        track = media_data.get("track", "unknown")
+                        
+                        if track == "inbound":
+                            logger.debug(f"[DEBUG] 🎤 Processing inbound audio")
+                            await agent.handle_incoming_audio(media_data)
+                        else:
+                            logger.debug(f"[DEBUG] 🎵 Ignoring {track} track")
+                    else:
+                        logger.warning(f"[DEBUG] ⚠️ Received media but agent not ready")
+                        
                 elif event_type == "stop":
-                    logger.info(f"[DEBUG] 🛑 Stream stopped")
+                    logger.info(f"[DEBUG] 🛑 Stream stopped by Twilio")
                     break
                     
                 else:
-                    logger.info(f"[DEBUG] ❓ Unknown event: {event_type}")
-                    logger.info(f"[DEBUG] Full data: {data}")
+                    logger.warning(f"[DEBUG] ❓ Unknown event: {event_type}")
                     
             except json.JSONDecodeError as e:
                 logger.error(f"[DEBUG] ❌ JSON decode error: {e}")
+                logger.error(f"[DEBUG] ❌ Raw message: {message}")
             except Exception as e:
                 logger.error(f"[DEBUG] ❌ Message processing error: {e}")
+                logger.error(f"[DEBUG] ❌ Full traceback: {traceback.format_exc()}")
                 
     except WebSocketDisconnect:
         logger.info(f"[DEBUG] 🔌 WebSocket disconnected after {message_count} messages")
     except Exception as e:
         logger.error(f"[DEBUG] ❌ WebSocket fatal error: {e}")
-        logger.error(traceback.format_exc())
+        logger.error(f"[DEBUG] ❌ Exception type: {type(e).__name__}")
+        logger.error(f"[DEBUG] ❌ Full traceback: {traceback.format_exc()}")
     finally:
-        logger.info(f"[DEBUG] 🧹 Cleanup for call")
+        logger.info(f"[DEBUG] 🧹 WebSocket cleanup starting...")
+        
+        # Cleanup agent
         if agent:
-            await agent.stop()
-        # Clean up both possible call_sids
+            try:
+                await agent.stop()
+                logger.info(f"[DEBUG] ✅ Agent stopped successfully")
+            except Exception as cleanup_error:
+                logger.error(f"[DEBUG] ❌ Agent cleanup error: {cleanup_error}")
+        
+        # Cleanup sessions
         for sid in [call_sid, temp_call_sid]:
             if sid and sid in active_sessions:
-                del active_sessions[sid]
-
+                try:
+                    del active_sessions[sid]
+                    logger.info(f"[DEBUG] ✅ Removed session: {sid}")
+                except Exception as session_error:
+                    logger.error(f"[DEBUG] ❌ Session cleanup error: {session_error}")
+        
+        logger.info(f"[DEBUG] 🧹 WebSocket cleanup completed")
 
 @app.get("/test-ws")
 async def test_websocket():
