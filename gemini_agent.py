@@ -26,7 +26,6 @@ client = genai.Client(
 CONFIG = types.LiveConnectConfig(
     response_modalities=["AUDIO"],
     speech_config=types.SpeechConfig(
-        language_code="en-US",
         voice_config=types.VoiceConfig(
             prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Puck")
         )
