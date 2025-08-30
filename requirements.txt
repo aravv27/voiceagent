@@ -8,3 +8,4 @@ python-dotenv==1.0.0
 pyttsx3==2.90  
 gtts==2.3.2
 pygame==2.6.1
+python-multipart==0.0.12
